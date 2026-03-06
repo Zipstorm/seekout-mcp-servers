@@ -8,12 +8,9 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: packages/search
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - run: uv sync --dev
-      - run: uv run ruff check seekout_mcp_search/ tests/
-      - run: uv run pytest -v
+      - run: uv sync --dev --package seekout-mcp-search
+      - run: uv run ruff check packages/search/seekout_mcp_search/ packages/search/tests/
+      - run: uv run pytest packages/search/tests -v
