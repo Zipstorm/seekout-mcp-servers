@@ -7,5 +7,5 @@ mcp.run(
     transport="streamable-http",
     host="0.0.0.0",
     port=settings.mcp_port,
-    stateless_http=True,
+    stateless_http=False,
 )
