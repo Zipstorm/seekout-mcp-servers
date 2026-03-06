@@ -1,23 +1,51 @@
 services:
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-
+  # ── MCP Server ──────────────────────────────────────────────────────
   mcp:
+    container_name: seekout-mcp-search
     build:
       context: .
       target: dev
     ports:
       - "8001:8001"
     environment:
-      SPOT_ENV: local
-      REDIS_URL: redis://redis:6379/0
+      - SPOT_ENV=${SPOT_ENV:-local}
+      - MCP_PORT=8001
+      - SEEKOUT_RUNTIME_API_ENDPOINT=${SEEKOUT_RUNTIME_API_ENDPOINT:-http://host.docker.internal:9000}
+      - SEEKOUT_RUNTIME_API_KEY=${SEEKOUT_RUNTIME_API_KEY:-}
+      - SEEKOUT_JWKS_URI=${SEEKOUT_JWKS_URI:-}
+      - SEEKOUT_OAUTH_ISSUER=${SEEKOUT_OAUTH_ISSUER:-}
+      - SEEKOUT_MCP_AUDIENCE=${SEEKOUT_MCP_AUDIENCE:-seekout-mcp-server}
+      - SEEKOUT_MCP_RESOURCE_URL=${SEEKOUT_MCP_RESOURCE_URL:-}
+      - MCP_INTERNAL_API_KEY=${MCP_INTERNAL_API_KEY:-}
+      - REDIS_URL=redis://redis:6379/0
+      - SESSION_TTL_SECONDS=${SESSION_TTL_SECONDS:-3600}
+      - QUERY_STORE_ENDPOINT=${QUERY_STORE_ENDPOINT:-}
+      - QUERY_STORE_API_KEY=${QUERY_STORE_API_KEY:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/mcp')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
+
+  # ── Infrastructure ────────────────────────────────────────────────────
+  redis:
+    container_name: seekout-mcp-redis
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  redis_data:

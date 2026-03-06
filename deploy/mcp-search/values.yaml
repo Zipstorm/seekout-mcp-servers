@@ -1,0 +1,263 @@
+namespace: spot
+
+commonlabels:
+  cloud: "true"
+  env: dev
+  app.kubernetes.io/managed-by: Helm
+
+deployment:
+  enabled: true
+  name: seekout-mcp-search
+  replicaCount: 1
+  progressDeadlineSeconds: 3600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+
+  restartPolicy: Always
+  labels:
+    app: seekout-mcp-search
+  annotations: {}
+
+  matchLabels:
+    service: seekout-mcp-search
+  pod:
+    labels:
+      app: seekout-mcp-search
+      service: seekout-mcp-search
+
+  containers:
+    - name: seekout-mcp-search
+      repository: seekoutcontainerregcommon.azurecr.io
+      image: seekout-mcp-search
+      tag: latest
+      imagePullPolicy: Always
+      ports:
+        - containerPort: 8001
+          protocol: TCP
+
+      env:
+        - name: SPOT_ENV
+          value: production
+        - name: MCP_PORT
+          value: "8001"
+        - name: SEEKOUT_RUNTIME_API_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: seekout-mcp-secret
+              key: SEEKOUT_RUNTIME_API_ENDPOINT
+        - name: SEEKOUT_RUNTIME_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: seekout-mcp-secret
+              key: SEEKOUT_RUNTIME_API_KEY
+        - name: SEEKOUT_JWKS_URI
+          valueFrom:
+            secretKeyRef:
+              name: seekout-mcp-secret
+              key: SEEKOUT_JWKS_URI
+        - name: SEEKOUT_OAUTH_ISSUER
+          valueFrom:
+            secretKeyRef:
+              name: seekout-mcp-secret
+              key: SEEKOUT_OAUTH_ISSUER
+        - name: SEEKOUT_MCP_AUDIENCE
+          value: seekout-mcp-server
+        - name: SEEKOUT_MCP_RESOURCE_URL
+          valueFrom:
+            secretKeyRef:
+              name: seekout-mcp-secret
+              key: SEEKOUT_MCP_RESOURCE_URL
+        - name: MCP_INTERNAL_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: seekout-mcp-secret
+              key: MCP_INTERNAL_API_KEY
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: seekout-mcp-secret
+              key: REDIS_URL
+        - name: SESSION_TTL_SECONDS
+          value: "3600"
+        - name: QUERY_STORE_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: seekout-mcp-secret
+              key: QUERY_STORE_ENDPOINT
+        - name: QUERY_STORE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: seekout-mcp-secret
+              key: QUERY_STORE_API_KEY
+
+      volumeMounts:
+        - name: secrets-store
+          mountPath: "/mnt/secrets-store"
+          readOnly: true
+
+      livenessProbe:
+        httpGet:
+          path: /mcp
+          port: 8001
+        initialDelaySeconds: 10
+        timeoutSeconds: 5
+        periodSeconds: 15
+        successThreshold: 1
+        failureThreshold: 3
+
+      readinessProbe:
+        httpGet:
+          path: /mcp
+          port: 8001
+        initialDelaySeconds: 5
+        timeoutSeconds: 5
+        periodSeconds: 10
+        successThreshold: 1
+        failureThreshold: 5
+
+  volumes:
+    - name: secrets-store
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: seekout-mcp-kv-dev
+      resources:
+        limits:
+          cpu: "1"
+          memory: 512Mi
+        requests:
+          cpu: "200m"
+          memory: 256Mi
+
+  nodeSelector:
+    pool-type: spot
+
+  tolerations:
+    - key: "spot"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+
+  podAntiAffinity: false
+
+service:
+  enabled: true
+  name: seekout-mcp-search
+  labels:
+    app: seekout-mcp-search
+    service: seekout-mcp-search
+  selector:
+    service: seekout-mcp-search
+  type: ClusterIP
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8001
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 8001
+
+ingress:
+  enabled: true
+  name: seekout-mcp-search-ingress
+  ingressClassName: internal-nginx-gateway
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    proxy-body-size: 50m
+  tls:
+    - hosts:
+        - seekout-mcp-search-dev.seekout.io # TODO: replace with actual domain
+      secretName: ingress-ssl-cert
+  hosts:
+    - host: seekout-mcp-search-dev.seekout.io # TODO: replace with actual domain
+      paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: seekout-mcp-search
+              port:
+                number: 80
+
+secretProviderClass:
+  enabled: true
+  name: seekout-mcp-kv-dev
+  userAssignedIdentityID: "cbbb1cb8-cebe-461e-94f1-1a038e474ab5" # TODO: replace with actual identity
+  keyvaultName: "spot-kv-dev" # TODO: replace with actual keyvault
+  cloudName: "AzurePublicCloud"
+  tenantId: "0a54704d-bba9-4e27-878e-fe460a591835"
+
+  objects:
+    - objectName: SEEKOUT-RUNTIME-API-ENDPOINT
+      objectType: secret
+    - objectName: SEEKOUT-RUNTIME-API-KEY
+      objectType: secret
+    - objectName: SEEKOUT-JWKS-URI
+      objectType: secret
+    - objectName: SEEKOUT-OAUTH-ISSUER
+      objectType: secret
+    - objectName: SEEKOUT-MCP-RESOURCE-URL
+      objectType: secret
+    - objectName: MCP-INTERNAL-API-KEY
+      objectType: secret
+    - objectName: REDIS-URL
+      objectType: secret
+    - objectName: QUERY-STORE-ENDPOINT
+      objectType: secret
+    - objectName: QUERY-STORE-API-KEY
+      objectType: secret
+
+  secretObjects:
+    - secretName: seekout-mcp-secret
+      type: Opaque
+      data:
+        - objectName: SEEKOUT-RUNTIME-API-ENDPOINT
+          key: SEEKOUT_RUNTIME_API_ENDPOINT
+        - objectName: SEEKOUT-RUNTIME-API-KEY
+          key: SEEKOUT_RUNTIME_API_KEY
+        - objectName: SEEKOUT-JWKS-URI
+          key: SEEKOUT_JWKS_URI
+        - objectName: SEEKOUT-OAUTH-ISSUER
+          key: SEEKOUT_OAUTH_ISSUER
+        - objectName: SEEKOUT-MCP-RESOURCE-URL
+          key: SEEKOUT_MCP_RESOURCE_URL
+        - objectName: MCP-INTERNAL-API-KEY
+          key: MCP_INTERNAL_API_KEY
+        - objectName: REDIS-URL
+          key: REDIS_URL
+        - objectName: QUERY-STORE-ENDPOINT
+          key: QUERY_STORE_ENDPOINT
+        - objectName: QUERY-STORE-API-KEY
+          key: QUERY_STORE_API_KEY
+
+hpa:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 5
+  cpuTarget: 80
+  memoryTarget: 80
+  scaleUp:
+    value: 1
+    periodSeconds: 300
+  scaleDown:
+    value: 1
+    periodSeconds: 600
+
+configMap:
+  enabled: false
+  name: seekout-mcp-search-config
+  data:
+    app-config: |
+      key1: value1
+
+serviceAccount:
+  create: false
+  name: spot-service-account
+  annotations: {}
