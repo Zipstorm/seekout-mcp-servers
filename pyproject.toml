@@ -1,0 +1,8 @@
+[project]
+name = "seekout-mcp-servers"
+version = "0.0.0"
+description = "SeekOut MCP server monorepo"
+requires-python = ">=3.12"
+
+[tool.uv.workspace]
+members = ["packages/*"]
