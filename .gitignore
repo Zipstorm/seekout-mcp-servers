@@ -4,3 +4,8 @@ __pycache__/
 *.egg-info/
 dist/
 .env
+.ruff_cache/
+
+# Agent local settings (user-specific)
+.claude/settings.local.json
+.agents/*.local.json
