@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from seekout_mcp_search.cache_store import CacheStore
 from seekout_mcp_search.entity_resolver import EntityResolver
 from seekout_mcp_search.query_builder import QueryBuilder
 from seekout_mcp_search.seekout_api import SeekOutAPI
@@ -16,6 +17,14 @@ def mock_seekout_api():
     api.validate_boolean = AsyncMock(return_value=(True, None))
     api.ping = AsyncMock(return_value=(200, 15.0))
     return api
+
+
+@pytest.fixture
+def mock_cache_store():
+    store = AsyncMock(spec=CacheStore)
+    store.cache_search = AsyncMock()
+    store.get_cached = AsyncMock(return_value=None)
+    return store
 
 
 @pytest.fixture

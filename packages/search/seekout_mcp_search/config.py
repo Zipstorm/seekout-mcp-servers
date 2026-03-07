@@ -21,9 +21,9 @@ class Settings(BaseSettings):
     # Auth — API key (internal agents)
     mcp_internal_api_key: str = ""
 
-    # Redis (session store)
+    # Redis (required — used for result caching)
     redis_url: str = "redis://localhost:6379/0"
-    session_ttl_seconds: int = 3600
+    cache_ttl_seconds: int = 3600
 
     # Query Store (for generating SeekOut app links)
     query_store_endpoint: str = "https://recruit-querystore-func-prod.azurewebsites.net/api/StoreQuery"

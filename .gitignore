@@ -5,6 +5,7 @@ __pycache__/
 dist/
 .env
 .ruff_cache/
+uv.lock
 
 # Agent local settings (user-specific)
 .claude/settings.local.json
