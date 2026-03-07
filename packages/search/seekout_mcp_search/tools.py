@@ -5,8 +5,10 @@ import httpx
 from mcp.types import ToolAnnotations
 
 from fastmcp import FastMCP
+from fastmcp.server.context import Context
 
 from seekout_mcp_search.cache_store import CacheStore
+from seekout_mcp_search.rate_limiter import RateLimiter, RateLimitExceeded
 from seekout_mcp_search.query_builder import (
     QueryBuilder,
     flat_params_to_filters,
@@ -28,10 +30,18 @@ def register_tools(
     query_builder: QueryBuilder,
     seekout_api: SeekOutAPI,
     cache_store: CacheStore,
+    rate_limiter: RateLimiter | None = None,
     query_store_endpoint: str = "",
     query_store_api_key: str = "",
 ) -> None:
     """Register all MCP tools on the FastMCP server."""
+
+    async def _check_rate_limit(ctx: Context) -> None:
+        """Check rate limit for the current user. No-op if no limiter configured."""
+        if rate_limiter is None:
+            return
+        user_id = ctx.client_id or "anonymous"
+        await rate_limiter.check(user_id)
 
     # ── Connectivity ──────────────────────────────────────────────────
 
@@ -127,7 +137,10 @@ def register_tools(
         max_results: int = 10,
         skip: int = 0,
         index: str = "NorthAmerica",
+        ctx: Context = None,
     ) -> dict:
+        if ctx:
+            await _check_rate_limit(ctx)
         filters = flat_params_to_filters(
             titles=titles, companies=companies, locations=locations,
             skills=skills, schools=schools,
@@ -221,7 +234,10 @@ def register_tools(
         country: str | None = None,
         state: str | None = None,
         index: str = "NorthAmerica",
+        ctx: Context = None,
     ) -> dict:
+        if ctx:
+            await _check_rate_limit(ctx)
         filters = flat_params_to_filters(
             titles=titles, companies=companies, locations=locations,
             skills=skills, schools=schools,
@@ -277,7 +293,10 @@ def register_tools(
         seniority: str | None = None,
         facet_types: str = "titles,companies,locations,skills",
         index: str = "NorthAmerica",
+        ctx: Context = None,
     ) -> dict:
+        if ctx:
+            await _check_rate_limit(ctx)
         filters = flat_params_to_filters(
             titles=titles, companies=companies, locations=locations,
             skills=skills, schools=schools,
@@ -323,7 +342,10 @@ def register_tools(
     async def seekout_get_profile(
         profile_key: str,
         index: str = "NorthAmerica",
+        ctx: Context = None,
     ) -> dict:
+        if ctx:
+            await _check_rate_limit(ctx)
         profile = await seekout_api.get_profile(profile_key, index)
         if profile is None:
             return {"error": "Profile not found", "profile_key": profile_key}
@@ -353,7 +375,10 @@ def register_tools(
         query: str,
         suggestion_type: str = "company",
         max_results: int = 10,
+        ctx: Context = None,
     ) -> dict:
+        if ctx:
+            await _check_rate_limit(ctx)
         results = await seekout_api.search_entities(
             suggestion_type, query, max_results=max_results
         )
@@ -379,7 +404,9 @@ def register_tools(
             openWorldHint=False,
         ),
     )
-    async def seekout_validate_query(query: str) -> dict:
+    async def seekout_validate_query(query: str, ctx: Context = None) -> dict:
+        if ctx:
+            await _check_rate_limit(ctx)
         is_valid, error = await seekout_api.validate_boolean(query)
         return {"valid": is_valid, "error": error}
 
@@ -418,7 +445,10 @@ def register_tools(
         max_results: int = 10,
         skip: int = 0,
         index: str = "NorthAmerica",
+        ctx: Context = None,
     ) -> dict:
+        if ctx:
+            await _check_rate_limit(ctx)
         filters = flat_params_to_filters(
             titles=titles, companies=companies, locations=locations,
             skills=skills, schools=schools,
@@ -463,7 +493,10 @@ def register_tools(
             years_experience_min: int | None = None,
             years_experience_max: int | None = None,
             seniority: str | None = None,
+            ctx: Context = None,
         ) -> dict:
+            if ctx:
+                await _check_rate_limit(ctx)
             filters = flat_params_to_filters(
                 titles=titles, companies=companies, locations=locations,
                 skills=skills, schools=schools,

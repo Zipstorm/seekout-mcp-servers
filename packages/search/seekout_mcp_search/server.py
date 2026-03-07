@@ -10,6 +10,7 @@ from seekout_mcp_search.auth import CompositeVerifier
 from seekout_mcp_search.cache_store import CacheStore
 from seekout_mcp_search.config import Settings
 from seekout_mcp_search.instructions import SEARCH_INSTRUCTIONS
+from seekout_mcp_search.rate_limiter import RateLimiter
 from seekout_mcp_search.seekout_api import SeekOutAPI
 from seekout_mcp_search.entity_resolver import EntityResolver
 from seekout_mcp_search.query_builder import QueryBuilder
@@ -72,12 +73,18 @@ def create_server(settings: Settings | None = None) -> FastMCP:
 
     redis_client = redis.from_url(settings.redis_url, decode_responses=True)
     cache_store = CacheStore(redis_client, ttl_seconds=settings.cache_ttl_seconds)
+    rate_limiter = RateLimiter(
+        redis_client,
+        max_daily=settings.rate_limit_daily,
+        max_per_second=settings.rate_limit_per_second,
+    )
 
     register_tools(
         mcp,
         query_builder,
         seekout_api,
         cache_store,
+        rate_limiter,
         query_store_endpoint=settings.query_store_endpoint,
         query_store_api_key=settings.query_store_api_key,
     )
