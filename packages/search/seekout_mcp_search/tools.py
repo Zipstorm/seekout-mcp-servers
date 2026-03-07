@@ -1,29 +1,49 @@
+import asyncio
+
 import httpx
+from mcp.types import ToolAnnotations
 
 from fastmcp import FastMCP
 
-from seekout_mcp_search.query_builder import QueryBuilder, flat_params_to_filters, DEFAULT_FACET_TYPES, FACET_TYPE_MAP
+from seekout_mcp_search.cache_store import CacheStore
+from seekout_mcp_search.query_builder import (
+    QueryBuilder,
+    flat_params_to_filters,
+    compute_yoe,
+    DEFAULT_FACET_TYPES,
+    FACET_TYPE_MAP,
+    GEOGRAPHIC_INDEXES,
+)
 from seekout_mcp_search.seekout_api import SeekOutAPI
-from seekout_mcp_search.session_store import SessionStore
 
 SEEKOUT_APP_BASE_URL = "https://app.seekout.io/app"
+
+# Concurrency limit for multi-index fan-out
+_FAN_OUT_SEM = asyncio.Semaphore(6)
 
 
 def register_tools(
     mcp: FastMCP,
     query_builder: QueryBuilder,
     seekout_api: SeekOutAPI,
-    session_store: SessionStore | None = None,
+    cache_store: CacheStore,
     query_store_endpoint: str = "",
     query_store_api_key: str = "",
 ) -> None:
     """Register all MCP tools on the FastMCP server."""
+
+    # ── Connectivity ──────────────────────────────────────────────────
 
     @mcp.tool(
         name="seekout_ping",
         description=(
             "Check connectivity to the SeekOut Runtime API. "
             "Returns status code, elapsed time, and echo message."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
         ),
     )
     async def seekout_ping(message: str = "pong") -> dict:
@@ -43,58 +63,131 @@ def register_tools(
                 "error": str(e),
             }
 
+    # ── Search ────────────────────────────────────────────────────────
+
     @mcp.tool(
         name="seekout_search_people",
         description=(
             "Search for candidates matching specific criteria. "
-            "Returns summarized profiles with name, title, company, location, skills, "
-            "and a profile_key for detailed lookup.\n\n"
+            "Returns summarized profiles with name, title, company, location, "
+            "skills, linkedin_url, years_of_experience, and a profile_key for "
+            "detailed lookup.\n\n"
             "WHEN TO USE: After getting a count with seekout_count_results, "
-            "or when you need to see actual candidate profiles.\n"
-            "WHEN NOT TO USE: If you just need a count, use seekout_count_results instead (faster).\n\n"
-            "PAGINATION: Use skip parameter to page through results. First call: skip=0. Next page: skip=10.\n\n"
-            "WORKFLOW: seekout_count_results -> seekout_search_people -> seekout_get_profile"
+            "or when you need to see actual candidate profiles.\n\n"
+            "PAGINATION: Use skip parameter to page through results. "
+            "First call: skip=0. Next page: skip=10.\n\n"
+            "MULTI-INDEX: Set index='all' to search all 6 geographic regions "
+            "in parallel. Results include source_index for each candidate.\n\n"
+            "FILTERS: All filter params accept comma-separated values. "
+            "Example: titles='Software Engineer, Staff Engineer', "
+            "companies='Google, Meta', seniority='Senior, Lead'\n\n"
+            "WORKFLOW: seekout_count_results -> seekout_search_people -> "
+            "seekout_get_profile"
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
         ),
     )
     async def seekout_search_people(
         query: str | None = None,
+        # Core entity filters
         titles: str | None = None,
         companies: str | None = None,
         locations: str | None = None,
         skills: str | None = None,
+        schools: str | None = None,
+        # Core range/enum filters
         years_experience_min: int | None = None,
         years_experience_max: int | None = None,
+        seniority: str | None = None,
+        # Advanced entity filters
+        prev_companies: str | None = None,
+        prev_titles: str | None = None,
+        majors: str | None = None,
+        degrees: str | None = None,
+        industries: str | None = None,
+        certifications: str | None = None,
+        # Advanced range filters
+        company_size_min: int | None = None,
+        company_size_max: int | None = None,
+        years_in_company_min: int | None = None,
+        years_in_company_max: int | None = None,
+        years_in_role_min: int | None = None,
+        years_in_role_max: int | None = None,
+        # String filters
+        languages: str | None = None,
+        country: str | None = None,
+        state: str | None = None,
+        # Pagination and index
         max_results: int = 10,
         skip: int = 0,
+        index: str = "NorthAmerica",
     ) -> dict:
         filters = flat_params_to_filters(
-            titles, companies, locations, skills,
-            years_experience_min, years_experience_max,
+            titles=titles, companies=companies, locations=locations,
+            skills=skills, schools=schools,
+            years_experience_min=years_experience_min,
+            years_experience_max=years_experience_max,
+            seniority=seniority,
+            prev_companies=prev_companies, prev_titles=prev_titles,
+            majors=majors, degrees=degrees, industries=industries,
+            certifications=certifications,
+            company_size_min=company_size_min, company_size_max=company_size_max,
+            years_in_company_min=years_in_company_min,
+            years_in_company_max=years_in_company_max,
+            years_in_role_min=years_in_role_min,
+            years_in_role_max=years_in_role_max,
+            languages=languages, country=country, state=state,
         )
+        clamped_top = max(1, min(max_results, 25))
+        clamped_skip = max(skip, 0)
+
+        if index == "all":
+            return await _fan_out_search(
+                query_builder, seekout_api, cache_store,
+                query=query or "", filters=filters,
+                top=clamped_top, skip=clamped_skip,
+            )
+
         search_query = await query_builder.build(
-            query=query or "",
-            filters=filters,
-            top=max(1, min(max_results, 25)),
-            skip=max(skip, 0),
-            facet_fields=DEFAULT_FACET_TYPES,
+            query=query or "", filters=filters,
+            top=clamped_top, skip=clamped_skip,
+            index=index, facet_fields=DEFAULT_FACET_TYPES,
         )
         results, total_count = await seekout_api.search_people(search_query)
 
+        # Cache results by search_id
+        search_id = results.get("search_id")
+        if search_id:
+            await cache_store.cache_search(search_id, search_query, results)
+
         return {
             "total_count": total_count,
-            "returned": len(results.get("WholePersonResults", [])),
-            "skip": skip,
-            "candidates": _summarize_candidates(results),
+            "returned": len(results.get("results", [])),
+            "skip": clamped_skip,
+            "search_id": search_id,
+            "candidates": _summarize_candidates(results, source_index=index),
             "facets": _extract_facets(results),
         }
 
     @mcp.tool(
         name="seekout_count_results",
         description=(
-            "Get the total count of candidates matching criteria without returning profiles. "
-            "Faster than seekout_search_people. Also returns facets for refinement.\n\n"
-            "WHEN TO USE: Before searching, to check how many results a query returns.\n"
-            "WORKFLOW: seekout_count_results -> seekout_search_people -> seekout_get_profile"
+            "Get the total count of candidates matching criteria without "
+            "returning profiles. Faster than seekout_search_people. "
+            "Also returns facets for refinement.\n\n"
+            "WHEN TO USE: Before searching, to check how many results "
+            "a query returns.\n\n"
+            "FILTERS: Same filter params as seekout_search_people.\n\n"
+            "WORKFLOW: seekout_count_results -> seekout_search_people -> "
+            "seekout_get_profile"
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
         ),
     )
     async def seekout_count_results(
@@ -103,18 +196,46 @@ def register_tools(
         companies: str | None = None,
         locations: str | None = None,
         skills: str | None = None,
+        schools: str | None = None,
         years_experience_min: int | None = None,
         years_experience_max: int | None = None,
+        seniority: str | None = None,
+        prev_companies: str | None = None,
+        prev_titles: str | None = None,
+        majors: str | None = None,
+        degrees: str | None = None,
+        industries: str | None = None,
+        certifications: str | None = None,
+        company_size_min: int | None = None,
+        company_size_max: int | None = None,
+        years_in_company_min: int | None = None,
+        years_in_company_max: int | None = None,
+        years_in_role_min: int | None = None,
+        years_in_role_max: int | None = None,
+        languages: str | None = None,
+        country: str | None = None,
+        state: str | None = None,
+        index: str = "NorthAmerica",
     ) -> dict:
         filters = flat_params_to_filters(
-            titles, companies, locations, skills,
-            years_experience_min, years_experience_max,
+            titles=titles, companies=companies, locations=locations,
+            skills=skills, schools=schools,
+            years_experience_min=years_experience_min,
+            years_experience_max=years_experience_max,
+            seniority=seniority,
+            prev_companies=prev_companies, prev_titles=prev_titles,
+            majors=majors, degrees=degrees, industries=industries,
+            certifications=certifications,
+            company_size_min=company_size_min, company_size_max=company_size_max,
+            years_in_company_min=years_in_company_min,
+            years_in_company_max=years_in_company_max,
+            years_in_role_min=years_in_role_min,
+            years_in_role_max=years_in_role_max,
+            languages=languages, country=country, state=state,
         )
         search_query = await query_builder.build(
-            query=query or "",
-            filters=filters,
-            top=0,
-            facet_fields=DEFAULT_FACET_TYPES,
+            query=query or "", filters=filters,
+            top=0, index=index, facet_fields=DEFAULT_FACET_TYPES,
         )
         results, total_count = await seekout_api.search_people(search_query)
 
@@ -126,10 +247,17 @@ def register_tools(
     @mcp.tool(
         name="seekout_get_facets",
         description=(
-            "Get facet breakdowns for a search query. Returns counts by company, title, "
-            "location, and/or skills.\n\n"
-            "WHEN TO USE: To understand the distribution of candidates across dimensions "
-            "before or after searching."
+            "Get facet breakdowns for a search query. Returns counts by "
+            "company, title, location, skills, schools, industries, etc.\n\n"
+            "WHEN TO USE: To understand the distribution of candidates "
+            "across dimensions before or after searching.\n\n"
+            "facet_types: comma-separated list from: titles, companies, "
+            "locations, skills, schools, industries, degrees, majors"
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
         ),
     )
     async def seekout_get_facets(
@@ -138,13 +266,19 @@ def register_tools(
         companies: str | None = None,
         locations: str | None = None,
         skills: str | None = None,
+        schools: str | None = None,
         years_experience_min: int | None = None,
         years_experience_max: int | None = None,
+        seniority: str | None = None,
         facet_types: str = "titles,companies,locations,skills",
+        index: str = "NorthAmerica",
     ) -> dict:
         filters = flat_params_to_filters(
-            titles, companies, locations, skills,
-            years_experience_min, years_experience_max,
+            titles=titles, companies=companies, locations=locations,
+            skills=skills, schools=schools,
+            years_experience_min=years_experience_min,
+            years_experience_max=years_experience_max,
+            seniority=seniority,
         )
         requested_fields = [
             FACET_TYPE_MAP[ft.strip()]
@@ -152,9 +286,8 @@ def register_tools(
             if ft.strip() in FACET_TYPE_MAP
         ]
         search_query = await query_builder.build(
-            query=query or "",
-            filters=filters,
-            top=0,
+            query=query or "", filters=filters,
+            top=0, index=index,
             facet_fields=requested_fields or DEFAULT_FACET_TYPES,
         )
         results, total_count = await seekout_api.search_people(search_query)
@@ -164,12 +297,22 @@ def register_tools(
             "facets": _extract_facets(results),
         }
 
+    # ── Profile drill-down ────────────────────────────────────────────
+
     @mcp.tool(
         name="seekout_get_profile",
         description=(
             "Get a detailed profile for a specific candidate. "
             "Use the profile_key from seekout_search_people results.\n\n"
-            "WHEN TO USE: After finding a candidate via search, to see their full profile."
+            "IMPORTANT: Pass the source_index from search results to ensure "
+            "the correct geographic index is queried.\n\n"
+            "WHEN TO USE: After finding a candidate via search, to see their "
+            "full profile including work history, education, and contact info."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
         ),
     )
     async def seekout_get_profile(
@@ -181,13 +324,24 @@ def register_tools(
             return {"error": "Profile not found", "profile_key": profile_key}
         return _summarize_profile(profile)
 
+    # ── Discovery / utility tools ─────────────────────────────────────
+
     @mcp.tool(
         name="seekout_get_suggestions",
         description=(
             "Get autocomplete suggestions for entity names. "
-            "Useful for discovering valid company, title, skill, location, school, "
-            "or industry names.\n\n"
-            "WHEN TO USE: When unsure about exact entity names to use in filters."
+            "Useful for discovering valid company, title, skill, location, "
+            "school, major, degree, industry, or certification names.\n\n"
+            "suggestion_type: one of 'company', 'title', 'skill', 'location', "
+            "'school', 'major', 'degree', 'industry', 'certification'\n\n"
+            "WHEN TO USE: When unsure about exact entity names to use in "
+            "filters. Example: seekout_get_suggestions(query='Goog', "
+            "suggestion_type='company') returns Google, Google Cloud, etc."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
         ),
     )
     async def seekout_get_suggestions(
@@ -210,7 +364,14 @@ def register_tools(
         description=(
             "Validate a boolean search expression. "
             "Returns whether the expression is valid and any error message.\n\n"
-            "WHEN TO USE: Before using a complex boolean query in seekout_search_people."
+            "WHEN TO USE: Before using a complex boolean query in "
+            "seekout_search_people. Supports AND, OR, NOT, parentheses, "
+            "and field: syntax."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
         ),
     )
     async def seekout_validate_query(query: str) -> dict:
@@ -220,12 +381,17 @@ def register_tools(
     @mcp.tool(
         name="seekout_get_query",
         description=(
-            "Returns the full PeopleSearchQuery object that would be built from the "
-            "given parameters. Does NOT execute a search. Useful for debugging entity "
-            "resolution (did 'Google' resolve to ID 60?) and seeing exactly what would "
+            "Returns the full PeopleSearchQuery object that would be built "
+            "from the given parameters. Does NOT execute a search. Useful "
+            "for debugging entity resolution and seeing exactly what would "
             "be sent to the Runtime API.\n\n"
-            "WHEN TO USE: When you want to inspect how parameters map to the search query "
-            "before executing a search."
+            "WHEN TO USE: When you want to inspect how parameters map to "
+            "the search query before executing a search."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
         ),
     )
     async def seekout_get_query(
@@ -234,33 +400,52 @@ def register_tools(
         companies: str | None = None,
         locations: str | None = None,
         skills: str | None = None,
+        schools: str | None = None,
         years_experience_min: int | None = None,
         years_experience_max: int | None = None,
+        seniority: str | None = None,
+        prev_companies: str | None = None,
+        prev_titles: str | None = None,
+        majors: str | None = None,
+        degrees: str | None = None,
+        industries: str | None = None,
+        certifications: str | None = None,
         max_results: int = 10,
         skip: int = 0,
+        index: str = "NorthAmerica",
     ) -> dict:
         filters = flat_params_to_filters(
-            titles, companies, locations, skills,
-            years_experience_min, years_experience_max,
+            titles=titles, companies=companies, locations=locations,
+            skills=skills, schools=schools,
+            years_experience_min=years_experience_min,
+            years_experience_max=years_experience_max,
+            seniority=seniority,
+            prev_companies=prev_companies, prev_titles=prev_titles,
+            majors=majors, degrees=degrees, industries=industries,
+            certifications=certifications,
         )
         search_query = await query_builder.build(
-            query=query or "",
-            filters=filters,
+            query=query or "", filters=filters,
             top=max(1, min(max_results, 25)),
-            skip=max(skip, 0),
+            skip=max(skip, 0), index=index,
         )
         return {"people_search_query": search_query}
 
-    # ── SeekOut app link tool ─────────────────────────────────────────
+    # ── SeekOut app link ──────────────────────────────────────────────
+
     if query_store_endpoint and query_store_api_key:
         @mcp.tool(
             name="seekout_get_link",
             description=(
-                "Generate a SeekOut app URL for a search. Builds the search query from "
-                "the given parameters, stores it in the SeekOut query store, and returns "
-                "a link to https://app.seekout.io/app that opens the search in the SeekOut UI.\n\n"
-                "WHEN TO USE: When the user wants to open or share search results in SeekOut.\n\n"
-                "WORKFLOW: Use the same parameters as seekout_search_people."
+                "Generate a SeekOut app URL for a search. Builds the search "
+                "query, stores it in the SeekOut query store, and returns "
+                "a link that opens the search in the SeekOut UI.\n\n"
+                "WHEN TO USE: When the user wants to open or share search "
+                "results in the SeekOut web application."
+            ),
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                openWorldHint=True,
             ),
         )
         async def seekout_get_link(
@@ -269,16 +454,20 @@ def register_tools(
             companies: str | None = None,
             locations: str | None = None,
             skills: str | None = None,
+            schools: str | None = None,
             years_experience_min: int | None = None,
             years_experience_max: int | None = None,
+            seniority: str | None = None,
         ) -> dict:
             filters = flat_params_to_filters(
-                titles, companies, locations, skills,
-                years_experience_min, years_experience_max,
+                titles=titles, companies=companies, locations=locations,
+                skills=skills, schools=schools,
+                years_experience_min=years_experience_min,
+                years_experience_max=years_experience_max,
+                seniority=seniority,
             )
             search_query = await query_builder.build(
-                query=query or "",
-                filters=filters,
+                query=query or "", filters=filters,
             )
 
             try:
@@ -300,173 +489,127 @@ def register_tools(
             url = f"{SEEKOUT_APP_BASE_URL}?queryId={query_id}"
             return {"url": url, "query_id": query_id}
 
-    # ── Stateful session tools ────────────────────────────────────────
-    if session_store is None:
-        return
 
-    @mcp.tool(
-        name="session_create",
-        description=(
-            "Create a new search session. Returns a session_id to use with other "
-            "session tools. Optionally set an initial boolean query.\n\n"
-            "WORKFLOW: session_create -> session_add_filter (repeat) -> session_run_search\n\n"
-            "Sessions expire after 1 hour of inactivity."
-        ),
+# ── Multi-index fan-out ───────────────────────────────────────────────
+
+
+async def _fan_out_search(
+    query_builder: QueryBuilder,
+    seekout_api: SeekOutAPI,
+    cache_store: CacheStore,
+    query: str,
+    filters: dict,
+    top: int,
+    skip: int,
+) -> dict:
+    """Search all geographic indexes in parallel, merge results."""
+    per_index_top = max(1, (top + len(GEOGRAPHIC_INDEXES) - 1) // len(GEOGRAPHIC_INDEXES))
+
+    async def _search_one(idx: str) -> dict:
+        async with _FAN_OUT_SEM:
+            sq = await query_builder.build(
+                query=query, filters=dict(filters),
+                top=per_index_top, skip=skip, index=idx,
+                facet_fields=DEFAULT_FACET_TYPES,
+            )
+            results, count = await seekout_api.search_people(sq)
+            return {"index": idx, "results": results, "count": count, "query": sq}
+
+    raw_results = await asyncio.gather(
+        *[_search_one(idx) for idx in GEOGRAPHIC_INDEXES],
+        return_exceptions=True,
     )
-    async def session_create(query: str = "") -> dict:
-        session = await session_store.create(query=query)
-        return {
-            "session_id": session["session_id"],
-            "query": session["query"],
-            "filters": {},
-            "message": "Session created. Use session_add_filter to build your search.",
-        }
 
-    @mcp.tool(
-        name="session_add_filter",
-        description=(
-            "Add or replace a filter on an existing session.\n\n"
-            "filter_type options:\n"
-            "  - 'titles': job titles (e.g., ['Software Engineer', 'Staff Engineer'])\n"
-            "  - 'companies': company names (e.g., ['Google', 'Meta'])\n"
-            "  - 'locations': locations (e.g., ['Seattle, WA', 'San Francisco'])\n"
-            "  - 'skills': skills (e.g., ['Python', 'Kubernetes'])\n"
-            "  - 'years_experience_min': minimum years (e.g., ['5'])\n"
-            "  - 'years_experience_max': maximum years (e.g., ['15'])\n"
-            "  - 'query': boolean search query (e.g., ['Python AND Django'])\n\n"
-            "Adding a filter_type that already exists replaces the previous values.\n\n"
-            "WHEN TO USE: After session_create, to incrementally build a search."
-        ),
-    )
-    async def session_add_filter(
-        session_id: str,
-        filter_type: str,
-        values: list[str],
-    ) -> dict:
-        session = await session_store.add_filter(session_id, filter_type, values)
-        if session is None:
-            return {"error": "Session not found or expired", "session_id": session_id}
-        return _format_session(session)
+    # Collect successes, skip failures
+    total_count = 0
+    all_candidates: list[dict] = []
+    merged_facets: dict[str, dict[str, int]] = {}
 
-    @mcp.tool(
-        name="session_remove_filter",
-        description=(
-            "Remove a filter from an existing session.\n\n"
-            "filter_type: same options as session_add_filter.\n\n"
-            "WHEN TO USE: To refine a search by removing a previously added filter."
-        ),
-    )
-    async def session_remove_filter(
-        session_id: str,
-        filter_type: str,
-    ) -> dict:
-        session = await session_store.remove_filter(session_id, filter_type)
-        if session is None:
-            return {"error": "Session not found or expired", "session_id": session_id}
-        return _format_session(session)
+    for r in raw_results:
+        if isinstance(r, Exception):
+            continue
+        total_count += r["count"]
 
-    @mcp.tool(
-        name="session_run_search",
-        description=(
-            "Execute a search using the accumulated session filters. "
-            "Returns candidates and facets.\n\n"
-            "WHEN TO USE: After building filters with session_add_filter.\n\n"
-            "PAGINATION: Use skip to page through results."
-        ),
-    )
-    async def session_run_search(
-        session_id: str,
-        max_results: int = 10,
-        skip: int = 0,
-    ) -> dict:
-        session = await session_store.get(session_id)
-        if session is None:
-            return {"error": "Session not found or expired", "session_id": session_id}
+        candidates = _summarize_candidates(r["results"], source_index=r["index"])
+        all_candidates.extend(candidates)
 
-        filters = dict(session["filters"])
-        search_query = await query_builder.build(
-            query=session.get("query", ""),
-            filters=filters,
-            top=max(1, min(max_results, 25)),
-            skip=max(skip, 0),
-            facet_fields=DEFAULT_FACET_TYPES,
-        )
-        results, total_count = await seekout_api.search_people(search_query)
+        # Merge facets: sum counts across indexes
+        for facet_name, entries in _extract_facets(r["results"]).items():
+            if facet_name not in merged_facets:
+                merged_facets[facet_name] = {}
+            for entry in entries:
+                name = entry["name"]
+                merged_facets[facet_name][name] = (
+                    merged_facets[facet_name].get(name, 0) + entry["count"]
+                )
 
-        return {
-            "session_id": session_id,
-            "total_count": total_count,
-            "returned": len(results.get("WholePersonResults", [])),
-            "skip": skip,
-            "candidates": _summarize_candidates(results),
-            "facets": _extract_facets(results),
-        }
+        # Cache each index's results
+        search_id = r["results"].get("search_id")
+        if search_id:
+            await cache_store.cache_search(search_id, r["query"], r["results"])
 
-    @mcp.tool(
-        name="session_get",
-        description=(
-            "Get the current state of a session — its query and accumulated filters.\n\n"
-            "WHEN TO USE: To inspect what filters are currently set before running a search."
-        ),
-    )
-    async def session_get(session_id: str) -> dict:
-        session = await session_store.get(session_id)
-        if session is None:
-            return {"error": "Session not found or expired", "session_id": session_id}
-        return _format_session(session)
+    # Round-robin merge: take candidates from each index in rotation up to top
+    merged_candidates: list[dict] = []
+    by_index: dict[str, list[dict]] = {}
+    for c in all_candidates:
+        idx = c.get("source_index", "unknown")
+        by_index.setdefault(idx, []).append(c)
 
-    @mcp.tool(
-        name="session_delete",
-        description="Delete a session and free its resources.",
-    )
-    async def session_delete(session_id: str) -> dict:
-        deleted = await session_store.delete(session_id)
-        return {
-            "session_id": session_id,
-            "deleted": deleted,
-        }
+    idx_iters = {idx: iter(cands) for idx, cands in by_index.items()}
+    while len(merged_candidates) < top and idx_iters:
+        exhausted = []
+        for idx, it in idx_iters.items():
+            if len(merged_candidates) >= top:
+                break
+            try:
+                merged_candidates.append(next(it))
+            except StopIteration:
+                exhausted.append(idx)
+        for idx in exhausted:
+            del idx_iters[idx]
 
-
-def _format_session(session: dict) -> dict:
-    """Format a session dict for tool response."""
-    filters = session.get("filters", {})
-    friendly: dict = {}
-
-    if "current_title" in filters:
-        friendly["titles"] = filters["current_title"].get("alt_names", [])
-    if "current_company" in filters:
-        friendly["companies"] = filters["current_company"].get("alt_names", [])
-    if "location" in filters:
-        friendly["locations"] = filters["location"].get("alt_names", [])
-    if "_skill_names" in filters:
-        friendly["skills"] = filters["_skill_names"]
-    if "years_of_experience" in filters:
-        yoe = filters["years_of_experience"]
-        if "min" in yoe:
-            friendly["years_experience_min"] = yoe["min"]
-        if "max" in yoe:
-            friendly["years_experience_max"] = yoe["max"]
+    # Convert merged facets to list format
+    facets_out: dict = {}
+    for facet_name, counts in merged_facets.items():
+        facets_out[facet_name] = sorted(
+            [{"name": n, "count": c} for n, c in counts.items()],
+            key=lambda x: x["count"],
+            reverse=True,
+        )[:10]
 
     return {
-        "session_id": session["session_id"],
-        "query": session.get("query", ""),
-        "filters": friendly,
+        "total_count": total_count,
+        "returned": len(merged_candidates),
+        "skip": skip,
+        "index": "all",
+        "indexes_searched": GEOGRAPHIC_INDEXES,
+        "candidates": merged_candidates,
+        "facets": facets_out,
     }
 
 
-def _summarize_candidates(results: dict) -> list[dict]:
+# ── Response formatting ───────────────────────────────────────────────
+
+
+def _summarize_candidates(results: dict, source_index: str = "NorthAmerica") -> list[dict]:
     """Extract candidate summaries from search results."""
     candidates = []
     for person in results.get("results", []):
         locations = person.get("locations") or []
+        li_urls = person.get("li_urls") or []
+        grad_year = person.get("grad_year")
         candidates.append({
             "profile_key": person.get("key"),
             "name": person.get("full_name"),
             "current_title": person.get("cur_title"),
             "current_company": person.get("cur_company"),
             "location": locations[0] if locations else None,
-            "skills": (person.get("skills") or [])[:10],
+            "linkedin_url": li_urls[0] if li_urls else None,
+            "years_of_experience": compute_yoe(grad_year),
+            "grad_year": grad_year,
+            "skills": (person.get("skills") or [])[:5],
             "headline": (person.get("headlines") or [None])[0],
+            "source_index": source_index,
         })
     return candidates
 
@@ -492,12 +635,17 @@ def _extract_facets(results: dict) -> dict:
 def _summarize_profile(profile: dict) -> dict:
     """Extract a detailed profile summary."""
     locations = profile.get("locations") or []
+    li_urls = profile.get("li_urls") or []
+    grad_year = profile.get("grad_year")
     return {
         "profile_key": profile.get("key"),
         "name": profile.get("full_name"),
         "current_title": profile.get("cur_title"),
         "current_company": profile.get("cur_company"),
         "location": locations[0] if locations else None,
+        "linkedin_url": li_urls[0] if li_urls else None,
+        "years_of_experience": compute_yoe(grad_year),
+        "grad_year": grad_year,
         "headline": (profile.get("headlines") or [None])[0],
         "summary": profile.get("summary"),
         "skills": (profile.get("skills") or [])[:15],

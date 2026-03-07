@@ -1,13 +1,14 @@
 import redis.asyncio as redis
 from fastmcp import FastMCP
+from fastmcp.experimental.transforms.code_mode import CodeMode
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
 from seekout_mcp_search.auth import CompositeVerifier
+from seekout_mcp_search.cache_store import CacheStore
 from seekout_mcp_search.config import Settings
 from seekout_mcp_search.seekout_api import SeekOutAPI
 from seekout_mcp_search.entity_resolver import EntityResolver
 from seekout_mcp_search.query_builder import QueryBuilder
-from seekout_mcp_search.session_store import SessionStore
 from seekout_mcp_search.tools import register_tools
 
 
@@ -36,6 +37,10 @@ def create_auth_verifier(settings: Settings):
 def create_server(settings: Settings | None = None) -> FastMCP:
     """Build a fully configured SeekOut MCP search server.
 
+    Uses Code Mode transform: LLM discovers tools via search + get_schema,
+    then executes them via Python code blocks. This collapses the tool surface
+    from N tools to 3 meta-tools (search, get_schema, execute).
+
     Usage:
       Standalone:  python -m seekout_mcp_search
       Library:     from seekout_mcp_search import create_server, Settings
@@ -45,7 +50,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
     settings = settings or Settings()
 
     verifier = create_auth_verifier(settings)
-    mcp = FastMCP("seekout-search", auth=verifier)
+    mcp = FastMCP("seekout-search", auth=verifier, transforms=[CodeMode()])
 
     seekout_api = SeekOutAPI(
         base_url=settings.seekout_runtime_api_endpoint,
@@ -55,13 +60,13 @@ def create_server(settings: Settings | None = None) -> FastMCP:
     query_builder = QueryBuilder(entity_resolver)
 
     redis_client = redis.from_url(settings.redis_url, decode_responses=True)
-    session_store = SessionStore(redis_client, ttl_seconds=settings.session_ttl_seconds)
+    cache_store = CacheStore(redis_client, ttl_seconds=settings.cache_ttl_seconds)
 
     register_tools(
         mcp,
         query_builder,
         seekout_api,
-        session_store,
+        cache_store,
         query_store_endpoint=settings.query_store_endpoint,
         query_store_api_key=settings.query_store_api_key,
     )
