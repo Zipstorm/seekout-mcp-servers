@@ -1,15 +1,21 @@
+from pathlib import Path
+
 import redis.asyncio as redis
 from fastmcp import FastMCP
 from fastmcp.experimental.transforms.code_mode import CodeMode
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from fastmcp.server.providers.skills import SkillsDirectoryProvider
 
 from seekout_mcp_search.auth import CompositeVerifier
 from seekout_mcp_search.cache_store import CacheStore
 from seekout_mcp_search.config import Settings
+from seekout_mcp_search.instructions import SEARCH_INSTRUCTIONS
 from seekout_mcp_search.seekout_api import SeekOutAPI
 from seekout_mcp_search.entity_resolver import EntityResolver
 from seekout_mcp_search.query_builder import QueryBuilder
 from seekout_mcp_search.tools import register_tools
+
+_SKILLS_DIR = Path(__file__).parent / "skills"
 
 
 def create_auth_verifier(settings: Settings):
@@ -50,7 +56,12 @@ def create_server(settings: Settings | None = None) -> FastMCP:
     settings = settings or Settings()
 
     verifier = create_auth_verifier(settings)
-    mcp = FastMCP("seekout-search", auth=verifier, transforms=[CodeMode()])
+    mcp = FastMCP(
+        "seekout-search",
+        instructions=SEARCH_INSTRUCTIONS,
+        auth=verifier,
+        transforms=[CodeMode()],
+    )
 
     seekout_api = SeekOutAPI(
         base_url=settings.seekout_runtime_api_endpoint,
@@ -70,5 +81,8 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         query_store_endpoint=settings.query_store_endpoint,
         query_store_api_key=settings.query_store_api_key,
     )
+
+    # Expose recruiter workflow skills as MCP resources
+    mcp.add_provider(SkillsDirectoryProvider(roots=_SKILLS_DIR))
 
     return mcp

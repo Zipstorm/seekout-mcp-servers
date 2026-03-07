@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 import httpx
 from mcp.types import ToolAnnotations
@@ -76,8 +77,10 @@ def register_tools(
             "or when you need to see actual candidate profiles.\n\n"
             "PAGINATION: Use skip parameter to page through results. "
             "First call: skip=0. Next page: skip=10.\n\n"
-            "MULTI-INDEX: Set index='all' to search all 6 geographic regions "
-            "in parallel. Results include source_index for each candidate.\n\n"
+            "INDEX: Defaults to NorthAmerica. Only use index='all' when the "
+            "user explicitly asks for a global/worldwide search. If the user "
+            "specifies a non-US location, pick the correct region: "
+            "Europe, Asia, SouthAmerica, Africa, Oceania.\n\n"
             "FILTERS: All filter params accept comma-separated values. "
             "Example: titles='Software Engineer, Staff Engineer', "
             "companies='Google, Meta', seniority='Senior, Lead'\n\n"
@@ -180,6 +183,8 @@ def register_tools(
             "Also returns facets for refinement.\n\n"
             "WHEN TO USE: Before searching, to check how many results "
             "a query returns.\n\n"
+            "INDEX: Defaults to NorthAmerica. Only use index='all' when "
+            "explicitly asked for a global search.\n\n"
             "FILTERS: Same filter params as seekout_search_people.\n\n"
             "WORKFLOW: seekout_count_results -> seekout_search_people -> "
             "seekout_get_profile"
@@ -304,8 +309,8 @@ def register_tools(
         description=(
             "Get a detailed profile for a specific candidate. "
             "Use the profile_key from seekout_search_people results.\n\n"
-            "IMPORTANT: Pass the source_index from search results to ensure "
-            "the correct geographic index is queried.\n\n"
+            "IMPORTANT: Pass the index param (from source_index in search results) "
+            "to ensure the correct geographic region is queried.\n\n"
             "WHEN TO USE: After finding a candidate via search, to see their "
             "full profile including work history, education, and contact info."
         ),
@@ -548,8 +553,9 @@ async def _fan_out_search(
         if search_id:
             await cache_store.cache_search(search_id, r["query"], r["results"])
 
-    # Round-robin merge: take candidates from each index in rotation up to top
+    # Round-robin merge with deduplication by profile_key
     merged_candidates: list[dict] = []
+    seen_keys: set[str] = set()
     by_index: dict[str, list[dict]] = {}
     for c in all_candidates:
         idx = c.get("source_index", "unknown")
@@ -562,7 +568,13 @@ async def _fan_out_search(
             if len(merged_candidates) >= top:
                 break
             try:
-                merged_candidates.append(next(it))
+                candidate = next(it)
+                key = candidate.get("profile_key")
+                if key and key in seen_keys:
+                    continue
+                if key:
+                    seen_keys.add(key)
+                merged_candidates.append(candidate)
             except StopIteration:
                 exhausted.append(idx)
         for idx in exhausted:
@@ -590,6 +602,15 @@ async def _fan_out_search(
 
 # ── Response formatting ───────────────────────────────────────────────
 
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(text: str | None) -> str | None:
+    """Remove HTML tags (e.g. query match highlights) from API responses."""
+    if not text:
+        return text
+    return _HTML_TAG_RE.sub("", text)
+
 
 def _summarize_candidates(results: dict, source_index: str = "NorthAmerica") -> list[dict]:
     """Extract candidate summaries from search results."""
@@ -600,15 +621,14 @@ def _summarize_candidates(results: dict, source_index: str = "NorthAmerica") -> 
         grad_year = person.get("grad_year")
         candidates.append({
             "profile_key": person.get("key"),
-            "name": person.get("full_name"),
-            "current_title": person.get("cur_title"),
-            "current_company": person.get("cur_company"),
-            "location": locations[0] if locations else None,
+            "name": _strip_html(person.get("full_name")),
+            "current_title": _strip_html(person.get("cur_title")),
+            "current_company": _strip_html(person.get("cur_company")),
+            "location": _strip_html(locations[0]) if locations else None,
             "linkedin_url": li_urls[0] if li_urls else None,
             "years_of_experience": compute_yoe(grad_year),
-            "grad_year": grad_year,
             "skills": (person.get("skills") or [])[:5],
-            "headline": (person.get("headlines") or [None])[0],
+            "headline": _strip_html((person.get("headlines") or [None])[0]),
             "source_index": source_index,
         })
     return candidates
@@ -633,42 +653,38 @@ def _extract_facets(results: dict) -> dict:
 
 
 def _summarize_profile(profile: dict) -> dict:
-    """Extract a detailed profile summary."""
+    """Extract a detailed profile summary — kept compact for token efficiency."""
     locations = profile.get("locations") or []
     li_urls = profile.get("li_urls") or []
     grad_year = profile.get("grad_year")
     return {
         "profile_key": profile.get("key"),
-        "name": profile.get("full_name"),
-        "current_title": profile.get("cur_title"),
-        "current_company": profile.get("cur_company"),
-        "location": locations[0] if locations else None,
+        "name": _strip_html(profile.get("full_name")),
+        "current_title": _strip_html(profile.get("cur_title")),
+        "current_company": _strip_html(profile.get("cur_company")),
+        "location": _strip_html(locations[0]) if locations else None,
         "linkedin_url": li_urls[0] if li_urls else None,
         "years_of_experience": compute_yoe(grad_year),
-        "grad_year": grad_year,
-        "headline": (profile.get("headlines") or [None])[0],
-        "summary": profile.get("summary"),
-        "skills": (profile.get("skills") or [])[:15],
-        "certifications": profile.get("certifications") or [],
+        "headline": _strip_html((profile.get("headlines") or [None])[0]),
+        "summary": _strip_html(profile.get("summary")),
+        "skills": (profile.get("skills") or [])[:10],
+        "certifications": (profile.get("certifications") or [])[:5],
         "work_history": [
             {
-                "title": pos.get("title"),
-                "company": pos.get("company"),
+                "title": _strip_html(pos.get("title")),
+                "company": _strip_html(pos.get("company")),
                 "start_date": pos.get("start_date"),
                 "end_date": pos.get("end_date"),
-                "description": pos.get("description"),
             }
-            for pos in (profile.get("positions") or [])[:10]
+            for pos in (profile.get("positions") or [])[:5]
         ],
         "education": [
             {
-                "school": edu.get("school"),
+                "school": _strip_html(edu.get("school")),
                 "degree": edu.get("degree"),
                 "major": edu.get("major"),
-                "start_date": edu.get("start_date"),
-                "end_date": edu.get("end_date"),
             }
-            for edu in (profile.get("educations") or [])[:5]
+            for edu in (profile.get("educations") or [])[:3]
         ],
-        "languages": profile.get("languages") or [],
+        "languages": (profile.get("languages") or [])[:5],
     }

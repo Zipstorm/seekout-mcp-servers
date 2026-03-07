@@ -145,7 +145,6 @@ class TestSummaryCandidates:
         candidate = data["candidates"][0]
         assert candidate["linkedin_url"] == "https://linkedin.com/in/jane"
         assert candidate["years_of_experience"] is not None
-        assert candidate["grad_year"] == 2015
         assert candidate["source_index"] == "NorthAmerica"
         assert len(candidate["skills"]) <= 5  # Capped at 5
         assert data["search_id"] == "test-id"
